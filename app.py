@@ -528,7 +528,8 @@ with col_graf:
             stackgroup="canal",
             line=dict(width=0),
             fillcolor=color,
-            hovertemplate=f"<b>{nombre}</b>: %{{y:.0f}}<extra></extra>"
+            hoverinfo="skip",
+            hovertemplate=None
         ))
 
     fig.add_trace(go.Scatter(
@@ -539,7 +540,11 @@ with col_graf:
         connectgaps=False,
         line=dict(color="#0F172A", width=3.2),
         marker=dict(size=7, color="#1D4ED8", line=dict(color="#FFFFFF", width=1.2)),
-        hovertemplate="<b>Casos 2026</b>: %{y:.0f}<extra></extra>"
+        hovertemplate=(
+            "<b>Semana epidemiológica: %{x}</b><br>"
+            "Cantidad de casos: %{y:.0f}"
+            "<extra></extra>"
+        )
     ))
 
     fig.update_layout(
@@ -571,10 +576,18 @@ with col_graf:
             font=dict(size=13, color="#0F172A"),
             bgcolor="rgba(255,255,255,0.92)"
         ),
+        hoverlabel=dict(
+            bgcolor="#FFFFFF",
+            bordercolor="#0F172A",
+            font=dict(
+                size=18,  # Ajusta a 16, 18 o 20 según el tamaño de letra deseado
+                color="#0F172A"
+            )
+        ),
         plot_bgcolor="#FFFFFF",
         paper_bgcolor="#FFFFFF",
         font=dict(color="#1E293B", size=13),
-        hovermode="x unified",
+        hovermode="closest",
         height=ALTURA_PANEL,
         margin=dict(l=25, r=25, t=50, b=25)
     )
