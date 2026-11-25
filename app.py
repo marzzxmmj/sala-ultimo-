@@ -240,10 +240,105 @@ st.markdown("""
 # --- CARGAR DATOS DESDE GOOGLE SHEETS ---
 SHEET_ID = "154r2-YajFh_1MxxNFbHACJX1AWAjAss7xC_fnFTtBnE"
 
+def _limpiar_numero(serie):
+    if serie.dtype == object:
+        serie = serie.astype(str).str.replace(",", ".", regex=False).str.strip()
+    return pd.to_numeric(serie, errors="coerce")
+
+def _procesar_hoja_canal_extra(excel_file, nombre_hoja, nombre_patologia, codigo):
+    """Lee una hoja con formato tabla epidemiológica (como la hoja '4' de COVID-19) y la adapta a BASE_CANAL."""
+    raw = pd.read_excel(excel_file, sheet_name=nombre_hoja, header=None)
+
+    fila_header = None
+    for idx, row in raw.iterrows():
+        valores = [str(v).strip().lower() for v in row.values if pd.notna(v)]
+        if any("semana epidemiol" in v for v in valores):
+            fila_header = idx
+            break
+
+    if fila_header is None:
+        return pd.DataFrame()
+
+    encabezados = [str(v).strip() if pd.notna(v) else f"col_{i}" for i, v in enumerate(raw.iloc[fila_header])]
+    sub = raw.iloc[fila_header + 1:].copy()
+    sub.columns = encabezados
+
+    col_semana = encabezados[0]
+    sub["Semana"] = _limpiar_numero(sub[col_semana])
+    sub = sub[sub["Semana"].between(1, 52)].copy()
+    sub["Semana"] = sub["Semana"].astype(int)
+
+    cols_hist = [c for c in encabezados if str(c).strip() in ["2021", "2022", "2023", "2024", "2025"]]
+    for c in cols_hist:
+        sub[c] = _limpiar_numero(sub[c])
+
+    col_q1 = next((c for c in encabezados if str(c).strip().upper() == "Q1"), None)
+    col_q2 = next((c for c in encabezados if str(c).strip().upper() == "Q2"), None)
+    col_q3 = next((c for c in encabezados if str(c).strip().upper() == "Q3"), None)
+    col_actual = next((c for c in encabezados if "2026" in str(c).replace(" ", "")), None)
+
+    q1 = _limpiar_numero(sub[col_q1]) if col_q1 else sub[cols_hist].quantile(0.25, axis=1)
+    q2 = _limpiar_numero(sub[col_q2]) if col_q2 else sub[cols_hist].quantile(0.50, axis=1)
+    q3 = _limpiar_numero(sub[col_q3]) if col_q3 else sub[cols_hist].quantile(0.75, axis=1)
+
+    if cols_hist:
+        q1 = q1.fillna(sub[cols_hist].quantile(0.25, axis=1))
+        q2 = q2.fillna(sub[cols_hist].quantile(0.50, axis=1))
+        q3 = q3.fillna(sub[cols_hist].quantile(0.75, axis=1))
+
+    casos_2026 = _limpiar_numero(sub[col_actual]) if col_actual else pd.Series(index=sub.index, dtype=float)
+
+    max_hist = sub[cols_hist].max(axis=1).max() if cols_hist else 0
+    max_2026 = casos_2026.max() if casos_2026.notna().any() else 0
+    max_q3 = q3.max() if q3.notna().any() else 0
+    techo = max(float(max_hist or 0), float(max_2026 or 0), float(max_q3 or 0)) * 1.15
+    if techo <= 0:
+        techo = 100.0
+
+    zona_exito = q1.fillna(0)
+    zona_seguridad = (q2 - q1).clip(lower=0).fillna(0)
+    zona_alarma = (q3 - q2).clip(lower=0).fillna(0)
+    zona_epidemia = (techo - q3).clip(lower=10).fillna(10)
+
+    def _clasificar(fila):
+        c = fila["Casos_Actuales"]
+        if pd.isna(c):
+            return None
+        if pd.notna(fila["Q3"]) and c > fila["Q3"]:
+            return "Epidemia"
+        if pd.notna(fila["Q2"]) and c > fila["Q2"]:
+            return "Alarma"
+        if pd.notna(fila["Q1"]) and c > fila["Q1"]:
+            return "Seguridad"
+        return "Éxito"
+
+    df_extra = pd.DataFrame({
+        "Patologia": nombre_patologia,
+        "Codigo": codigo,
+        "Semana": sub["Semana"].values,
+        "Casos_Actuales": casos_2026.values,
+        "Q1": q1.values,
+        "Q2": q2.values,
+        "Q3": q3.values,
+        "Zona_Exito": zona_exito.values,
+        "Zona_Seguridad": zona_seguridad.values,
+        "Zona_Alarma": zona_alarma.values,
+        "Zona_Epidemia": zona_epidemia.values,
+        "Techo_Canal": techo,
+        "Hoja_Origen": str(nombre_hoja)
+    })
+
+    df_extra["Clasificacion"] = df_extra.apply(_clasificar, axis=1)
+    df_extra["Es_Epidemia"] = (df_extra["Clasificacion"] == "Epidemia").astype(int)
+    df_extra["Es_Alerta"] = df_extra["Clasificacion"].isin(["Alarma", "Epidemia"]).astype(int)
+
+    return df_extra
+
 @st.cache_data(ttl=600)
 def cargar_datos(sheet_id):
     url = f"https://docs.google.com/spreadsheets/d/{sheet_id}/export?format=xlsx"
-    df_leido = pd.read_excel(url, sheet_name="BASE_CANAL")
+    excel_file = pd.ExcelFile(url)
+    df_leido = pd.read_excel(excel_file, sheet_name="BASE_CANAL")
 
     cols_numericas = [
         "Semana", "Casos_Actuales", "Q1", "Q2", "Q3",
@@ -252,13 +347,24 @@ def cargar_datos(sheet_id):
     ]
     for col in cols_numericas:
         if col in df_leido.columns:
-            if df_leido[col].dtype == object:
-                df_leido[col] = df_leido[col].astype(str).str.replace(",", ".", regex=False)
-            df_leido[col] = pd.to_numeric(df_leido[col], errors="coerce")
+            df_leido[col] = _limpiar_numero(df_leido[col])
 
-    # Filtrar estrictamente las 52 semanas epidemiológicas
     df_leido = df_leido[df_leido["Semana"].between(1, 52)].copy()
     df_leido["Semana"] = df_leido["Semana"].astype(int)
+
+    patologias_actuales = df_leido["Patologia"].dropna().astype(str).str.upper().tolist()
+    ya_tiene_covid = any("COVID" in p for p in patologias_actuales)
+
+    if not ya_tiene_covid:
+        hojas_disponibles = [str(s) for s in excel_file.sheet_names]
+        hoja_covid = next(
+            (s for s in hojas_disponibles if s.strip().upper() in ["4", "COVID 19", "COVID-19", "COVID19"]),
+            None
+        )
+        if hoja_covid is not None:
+            df_covid = _procesar_hoja_canal_extra(excel_file, hoja_covid, "COVID-19", "COVID-19")
+            if not df_covid.empty:
+                df_leido = pd.concat([df_leido, df_covid], ignore_index=True)
 
     return df_leido
 
@@ -437,18 +543,21 @@ with col_graf:
     ))
 
     fig.update_layout(
+        dragmode=False,
         xaxis=dict(
             title=dict(text="Semana epidemiológica", font=dict(size=14, color="#0F172A")),
             tickfont=dict(size=13, color="#1E293B"),
             tickmode="linear",
             dtick=5,
             range=[rango_semanas[0], rango_semanas[1]],
+            fixedrange=True,
             showgrid=True,
             gridcolor="#F1F5F9"
         ),
         yaxis=dict(
             title=dict(text="Número de casos", font=dict(size=14, color="#0F172A")),
             tickfont=dict(size=13, color="#1E293B"),
+            fixedrange=True,
             showgrid=True,
             gridcolor="#E2E8F0",
             rangemode="tozero"
@@ -470,7 +579,7 @@ with col_graf:
         margin=dict(l=25, r=25, t=50, b=25)
     )
 
-    st.plotly_chart(fig, use_container_width=True)
+    st.plotly_chart(fig, use_container_width=True, config={"displayModeBar": False})
 
 with col_tabla:
     st.markdown('<div class="section-title">Detalle epidemiológico</div>', unsafe_allow_html=True)
@@ -521,6 +630,7 @@ fig_barras.add_trace(go.Bar(
 ))
 
 fig_barras.update_layout(
+    dragmode=False,
     title=dict(
         text=f"Distribución semanal de casos registrados — Gestión 2026 ({patologia})",
         font=dict(size=17, color="#0F172A"),
@@ -529,12 +639,14 @@ fig_barras.update_layout(
     xaxis=dict(
         title=dict(text="Semana epidemiológica (Gestión 2026)", font=dict(size=14, color="#0F172A")),
         tickfont=dict(size=12.5, color="#1E293B"),
+        fixedrange=True,
         showgrid=False,
         tickangle=-35 if len(datos_2026) > 15 else 0
     ),
     yaxis=dict(
         title=dict(text="Total de casos", font=dict(size=14, color="#0F172A")),
         tickfont=dict(size=13, color="#1E293B"),
+        fixedrange=True,
         showgrid=True,
         gridcolor="#E2E8F0",
         rangemode="tozero",
@@ -548,7 +660,7 @@ fig_barras.update_layout(
     showlegend=False
 )
 
-st.plotly_chart(fig_barras, use_container_width=True)
+st.plotly_chart(fig_barras, use_container_width=True, config={"displayModeBar": False})
 
 # --- COMPARACIÓN 2026 FRENTE A CUARTILES (Q1, Q2, Q3) ---
 st.markdown(
@@ -594,7 +706,6 @@ with z4:
 
 st.markdown("<div style='height: 0.65rem;'></div>", unsafe_allow_html=True)
 
-# Preparar tabla de cuartiles (sin 'None' en semanas aún no reportadas y fila pintada según comportamiento)
 df_cuartiles_base = datos[["Semana", "Casos_Actuales", "Q1", "Q2", "Q3", "Clasificacion"]].copy()
 df_cuartiles_base["Clasificacion_Limpia"] = df_cuartiles_base.apply(
     lambda r: "—" if pd.isna(r["Casos_Actuales"]) else r["Clasificacion"],
@@ -616,13 +727,13 @@ def _pintar_fila_epidemiologica(row):
 
     estado = str(row["Clasificación"]).lower()
     if "epidemia" in estado:
-        bg = "#EF9A9A"  # Zona Epidemia
+        bg = "#EF9A9A"
     elif "alarma" in estado:
-        bg = "#FFB65C"  # Zona Alarma
+        bg = "#FFB65C"
     elif "seguridad" in estado:
-        bg = "#F5DF72"  # Zona Seguridad
+        bg = "#F5DF72"
     elif "éxito" in estado or "exito" in estado:
-        bg = "#81C995"  # Zona Éxito
+        bg = "#81C995"
     else:
         bg = "#FFFFFF"
 
